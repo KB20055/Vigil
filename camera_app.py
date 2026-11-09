@@ -2,6 +2,7 @@ from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread
+from time import perf_counter
 from urllib.parse import urlparse
 import os
 import tkinter as tk
@@ -28,7 +29,7 @@ class CameraApp:
         )
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
-        self.camera_number = tk.StringVar(value="1")
+        self.camera_number = tk.StringVar(value="0")
         self.webhook = tk.StringVar(
             value=os.environ.get("DISCORD_WEBHOOK_URL", "")
         )
@@ -58,7 +59,7 @@ class CameraApp:
         settings = ttk.Frame(root, padding=(10, 0, 10, 10))
         settings.pack(fill="x")
 
-        ttk.Label(settings, text="Discord webhook:").pack(side="left")
+        ttk.Label(settings, text="Webhook (optional):").pack(side="left")
 
         ttk.Entry(
             settings, textvariable=self.webhook, show="*"
@@ -74,7 +75,7 @@ class CameraApp:
 
         self.capture_button = ttk.Button(
             root,
-            text="Capture & Send",
+            text="Capture snapshot",
             command=self.capture,
             state="disabled",
         )
@@ -162,18 +163,13 @@ class CameraApp:
             return
 
         url = self.webhook.get().strip()
-        parsed = urlparse(url)
-
-        if (
-            parsed.scheme != "https"
-            or parsed.hostname != "discord.com"
-            or not parsed.path.startswith("/api/webhooks/")
-        ):
-            messagebox.showerror(
-                "Webhook",
-                "Paste a Discord webhook URL beginning with "
-                "https://discord.com/api/webhooks/",
-            )
+        try:
+            parsed = urlparse(url)
+            valid_url = parsed.scheme == "https" and bool(parsed.hostname)
+        except ValueError:
+            valid_url = False
+        if url and not valid_url:
+            messagebox.showerror("Webhook", "Enter an HTTPS URL or leave the field empty.")
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -185,6 +181,10 @@ class CameraApp:
                 raise OSError("Image could not be saved.")
         except (OSError, cv2.error):
             self.status.set("Could not save the snapshot.")
+            return
+
+        if not url:
+            self.status.set(f"Saved {filename}")
             return
 
         self.uploading = True
@@ -201,15 +201,17 @@ class CameraApp:
         # Worker threads report through a queue; only the main
         # thread updates Tkinter widgets.
         try:
+            parsed = urlparse(url)
+            discord = parsed.hostname == "discord.com" and parsed.path.startswith("/api/webhooks/")
             with filename.open("rb") as image:
                 response = requests.post(
                     url,
-                    params={"wait": "true"},
+                    params={"wait": "true"} if discord else None,
                     data={
                         "content": f"Camera snapshot: {filename.name}"
                     },
                     files={
-                        "files[0]": (
+                        ("files[0]" if discord else "file"): (
                             filename.name,
                             image,
                             "image/jpeg",
@@ -218,10 +220,10 @@ class CameraApp:
                     timeout=(10, 20),
                 )
 
-            if response.status_code == 200:
-                result = "Snapshot sent to Discord."
+            if 200 <= response.status_code < 300:
+                result = "Snapshot delivered."
             elif response.status_code == 429:
-                result = "Discord rate limit reached. Wait before retrying."
+                result = "Webhook rate limit reached. Wait before retrying."
             else:
                 result = (
                     f"Upload failed: HTTP {response.status_code}. "
@@ -231,7 +233,7 @@ class CameraApp:
         except requests.Timeout:
             result = (
                 "Upload timed out; delivery is unconfirmed. "
-                "Check Discord before retrying."
+                "Check the receiver before retrying."
             )
         except requests.RequestException:
             result = "Network error. Snapshot remains saved locally."
@@ -267,7 +269,81 @@ class CameraApp:
         self.root.destroy()
 
 
+class PersonDetectionApp(CameraApp):
+    def __init__(self, root):
+        super().__init__(root)
+        self.model = None
+        self.busy = False
+        self.generation = 0
+        self.last_frame = None
+        self.results = Queue()
+        self.enabled = tk.BooleanVar(value=False)
+        panel = ttk.Frame(root, padding=5)
+        panel.pack(fill="x", before=self.preview)
+        ttk.Checkbutton(panel, text="Detect people", variable=self.enabled,
+                        command=self.reset_detection).pack(side="left")
+        self.detection_status = ttk.Label(panel, text="Detection off.")
+        self.detection_status.pack(side="left", padx=10)
+        self.detection_image = ttk.Label(panel)
+        self.detection_image.pack(side="right")
+        root.after(150, self.poll_detection)
+
+    def reset_detection(self):
+        self.generation += 1
+        self.last_frame = None
+        self.detection_image.configure(image="")
+        self.detection_image.image = None
+        message = "Waiting for a camera frame." if self.enabled.get() else "Detection off."
+        self.detection_status.configure(text=message)
+
+    def stop_camera(self):
+        super().stop_camera()
+        self.reset_detection()
+
+    def detect(self, frame, generation):
+        try:
+            if self.model is None:
+                from ultralytics import YOLO
+                self.model = YOLO(str(Path(__file__).with_name("yolo26n.pt")))
+            started = perf_counter()
+            result = self.model.predict(frame, classes=[0], conf=0.5, imgsz=320,
+                                        device="cpu", verbose=False)[0]
+            elapsed = 1000 * (perf_counter() - started)
+            small = cv2.resize(result.plot(), (240, max(1, round(240 * frame.shape[0] / frame.shape[1]))))
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            status = f"Last analyzed frame: {len(result.boxes)} people | {elapsed:.0f} ms"
+            self.results.put((generation, status, rgb))
+        except Exception as exc:
+            self.results.put((generation, f"Detection stopped: {exc}", None))
+
+    def poll_detection(self):
+        try:
+            generation, status, rgb = self.results.get_nowait()
+        except Empty:
+            pass
+        else:
+            self.busy = False
+            if generation == self.generation:
+                if rgb is None:
+                    self.enabled.set(False)
+                    self.reset_detection()
+                else:
+                    photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+                    self.detection_image.configure(image=photo)
+                    self.detection_image.image = photo
+                self.detection_status.configure(text=status)
+
+        frame = self.frame
+        if self.enabled.get() and not self.busy and frame is not None and frame is not self.last_frame:
+            self.last_frame = frame
+            self.busy = True
+            if self.model is None:
+                self.detection_status.configure(text="Loading YOLO model...")
+            Thread(target=self.detect, args=(frame.copy(), self.generation), daemon=True).start()
+        self.root.after(150, self.poll_detection)
+
+
 if __name__ == "__main__":
     window = tk.Tk()
-    app = CameraApp(window)
+    app = PersonDetectionApp(window)
     window.mainloop()
